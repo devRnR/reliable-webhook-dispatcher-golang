@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -73,4 +74,67 @@ func (s *OutboxStore) List(ctx context.Context, limit int) ([]OutboxEvent, error
 	}
 
 	return events, rows.Err()
+}
+
+type ClaimedEvent struct {
+	ID           string
+	EventType    string
+	Payload      []byte
+	ClaimToken   string
+	AttemptCount int
+}
+
+func (s *OutboxStore) ClaimNext(ctx context.Context) (*ClaimedEvent, error) {
+	const q = `
+				UPDATE outbox_events
+				SET status = 'PROCESSING',
+				    claim_token = gen_random_uuid(),
+				    processing_started_at = now(),
+				    updated_at = now()
+				WHERE id = (
+				    SELECT id
+				    FROM outbox_events
+				    WHERE status = 'PENDING'
+				    AND (next_retry_at IS NULL OR next_retry_at <= now())
+				    ORDER BY created_at ASC
+				    LIMIT 1
+				)
+				RETURNING id, event_type, payload, claim_token, attempt_count`
+	var e ClaimedEvent
+	err := s.DB.QueryRowContext(ctx, q).Scan(&e.ID, &e.EventType, &e.Payload, &e.ClaimToken, &e.AttemptCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &e, nil
+}
+
+func (s *OutboxStore) MarkSent(ctx context.Context, id, claimToken string) error {
+	_, err := s.DB.ExecContext(ctx,
+		`UPDATE outbox_events 
+			   SET status = 'SENT',
+			       sent_at = now(),
+			       claim_token = NULL,
+			       processing_started_at = NULL,
+					updated_at = now() 
+			   WHERE id = $1
+			     AND status = 'PROCESSING'
+			     AND claim_token = $2`, id, claimToken)
+	return err
+}
+
+func (s *OutboxStore) ReleaseToPending(ctx context.Context, id, claimToken string) error {
+	_, err := s.DB.ExecContext(ctx,
+		`UPDATE outbox_events
+			   SET status = 'PENDING',
+			       claim_token = NULL,
+			       processing_started_at = NULL,
+			       updated_at = now()
+			   WHERE id=$1
+			   AND status = 'PROCESSING'
+			   AND claim_token = $2`, id, claimToken)
+	return err
 }

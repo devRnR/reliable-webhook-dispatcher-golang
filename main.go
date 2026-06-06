@@ -14,6 +14,8 @@ import (
 	"os/signal"
 	"reliable-webhook-dispatcher/internal/config"
 	"reliable-webhook-dispatcher/internal/httpapi"
+	"reliable-webhook-dispatcher/internal/store"
+	"reliable-webhook-dispatcher/internal/worker"
 	"syscall"
 	"time"
 )
@@ -25,7 +27,6 @@ func main() {
 	if err := godotenv.Load(); err != nil {
 		logger.Error("env 파일 로드 실패", "err", err)
 	}
-
 	cfg := config.Load()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -61,6 +62,19 @@ func main() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("http 서버 에러", "err", err)
 			stop()
+		}
+	}()
+
+	dispatcher := &worker.Dispatcher{
+		Store:        store.NewOutboxStore(db),
+		TargetUrl:    cfg.WebhookTargetURL,
+		HTTPClient:   &http.Client{Timeout: 5 * time.Second},
+		PollInterval: 2 * time.Second,
+		Logger:       logger,
+	}
+	go func() {
+		if err := dispatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("dispatcher 종료", "err", err)
 		}
 	}()
 
