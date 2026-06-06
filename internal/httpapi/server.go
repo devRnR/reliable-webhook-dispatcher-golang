@@ -16,6 +16,7 @@ func NewServer(add string, db *sql.DB) *http.Server {
 	mux.HandleFunc("GET /health", health)
 	mux.HandleFunc("POST /orders", orderH.Create)
 	mux.HandleFunc("GET /outbox", outboxH.List)
+	mux.HandleFunc("POST /mock/webhook", MockWebhookReceiver)
 
 	return &http.Server{Addr: add, Handler: mux}
 }
