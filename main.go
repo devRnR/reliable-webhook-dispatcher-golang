@@ -54,7 +54,7 @@ func main() {
 	logger.Info("db 연결 성공")
 
 	// HTTP 서버 시작
-	srv := httpapi.NewServer(cfg.HTTPAddr)
+	srv := httpapi.NewServer(cfg.HTTPAddr, db)
 	go func() {
 		logger.Info("http 서버 시작", "addr", cfg.HTTPAddr)
 
