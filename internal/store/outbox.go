@@ -112,8 +112,9 @@ func (s *OutboxStore) ClaimNext(ctx context.Context) (*ClaimedEvent, error) {
 	return &e, nil
 }
 
-func (s *OutboxStore) MarkSent(ctx context.Context, id, claimToken string) error {
-	_, err := s.DB.ExecContext(ctx,
+// deprecated
+func (s *OutboxStore) MarkSent(ctx context.Context, id, claimToken string) (int64, error) {
+	res, err := s.DB.ExecContext(ctx,
 		`UPDATE outbox_events 
 			   SET status = 'SENT',
 			       sent_at = now(),
@@ -123,11 +124,15 @@ func (s *OutboxStore) MarkSent(ctx context.Context, id, claimToken string) error
 			   WHERE id = $1
 			     AND status = 'PROCESSING'
 			     AND claim_token = $2`, id, claimToken)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
-func (s *OutboxStore) ReleaseToPending(ctx context.Context, id, claimToken string) error {
-	_, err := s.DB.ExecContext(ctx,
+// deprecated
+func (s *OutboxStore) ReleaseToPending(ctx context.Context, id, claimToken string) (int64, error) {
+	res, err := s.DB.ExecContext(ctx,
 		`UPDATE outbox_events
 			   SET status = 'PENDING',
 			       claim_token = NULL,
@@ -136,5 +141,52 @@ func (s *OutboxStore) ReleaseToPending(ctx context.Context, id, claimToken strin
 			   WHERE id=$1
 			   AND status = 'PROCESSING'
 			   AND claim_token = $2`, id, claimToken)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// MarkSentTx: 2xx 성공 반영(같은 tx). claim_token guard. 영향행 수를 반환.
+func (s *OutboxStore) MarkSentTx(ctx context.Context, tx *sql.Tx, id, claimToken string, attemptNo int) (int64, error) {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE outbox_events
+		    SET status='SENT', attempt_count=$3, sent_at=now(),
+		        last_error=NULL, claim_token=NULL, processing_started_at=NULL, updated_at=now()
+		  WHERE id=$1 AND status='PROCESSING' AND claim_token=$2`, id, claimToken, attemptNo)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// MarkRetryTx: 실패 + 재시도 가능 → PENDING, next_retry_at/last_error 기록.
+func (s *OutboxStore) MarkRetryTx(ctx context.Context, tx *sql.Tx, id, claimToken string, attemptNo int, nextRetryAt time.Time, lastErr string) (int64, error) {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE outbox_events
+		    SET status='PENDING', attempt_count=$3, next_retry_at=$4, last_error=$5,
+		        claim_token=NULL, processing_started_at=NULL, updated_at=now()
+		  WHERE id=$1 AND status='PROCESSING' AND claim_token=$2`, id, claimToken, attemptNo, nextRetryAt, lastErr)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *OutboxStore) MarkFailed(ctx context.Context, tx *sql.Tx, id, claimToken string, attemptNo int, lastErr string) (int64, error) {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE outbox_events
+			   SET status = 'FAILED',
+			       attempt_count = $3,
+			       last_error = $4,
+			       claim_token = NULL,
+			       processing_started_at = NULL,
+			       updated_at = now()
+				WHERE id=$1
+				  AND status = 'PROCESSING'
+				  AND claim_token = $2`, id, claimToken, attemptNo, lastErr)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
