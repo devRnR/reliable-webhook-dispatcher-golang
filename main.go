@@ -65,11 +65,15 @@ func main() {
 		}
 	}()
 
+	// Worker dispatcher 시작
 	dispatcher := &worker.Dispatcher{
-		Store:        store.NewOutboxStore(db),
+		DB:           db,
+		Outbox:       store.NewOutboxStore(db),
+		Delivery:     store.NewDeliveryStore(db),
 		TargetUrl:    cfg.WebhookTargetURL,
 		HTTPClient:   &http.Client{Timeout: 5 * time.Second},
 		PollInterval: 2 * time.Second,
+		Retry:        worker.RetryPolicy{MaxAttempts: 5},
 		Logger:       logger,
 	}
 	go func() {
