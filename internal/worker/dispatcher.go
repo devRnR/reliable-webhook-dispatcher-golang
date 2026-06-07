@@ -37,6 +37,7 @@ type Dispatcher struct {
 	PollInterval time.Duration
 	Retry        RetryPolicy
 	Logger       *slog.Logger
+	BatchSize    int
 }
 
 func (d *Dispatcher) Run(ctx context.Context) error {
@@ -56,28 +57,40 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 }
 
 func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
-	ev, err := d.Outbox.ClaimNext(ctx)
-	if err != nil || ev == nil {
+	events, err := d.Outbox.ClaimPending(ctx, d.BatchSize)
+	if err != nil {
 		return err
 	}
+	for i := range events {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		d.dispatchEvent(ctx, &events[i])
+	}
 
+	return nil
+}
+
+func (d *Dispatcher) dispatchEvent(ctx context.Context, ev *store.ClaimedEvent) {
 	attemptNo := ev.AttemptCount + 1
 	att := store.DeliveryAttempt{
 		EventID: ev.ID, ClaimToken: ev.ClaimToken, TargetURL: d.TargetUrl, AttemptNo: attemptNo,
 	}
 
 	// 외부 호출은 transaction 밖
-
 	code, body, callErr := d.send(ctx, ev)
 	att.ResponseCode = code
 	att.ResponseBody = body
+
 	if callErr != nil {
 		att.ErrorMessage = callErr.Error()
 	}
 
 	oc := classify(code, callErr, attemptNo, d.Retry.MaxAttempts)
 	att.Success = oc == outSent
-	return d.complete(ctx, att, oc)
+	if err := d.complete(ctx, att, oc); err != nil {
+		d.Logger.Error("delivery failed", "err", err)
+	}
 }
 
 func (d *Dispatcher) send(ctx context.Context, ev *store.ClaimedEvent) (int, string, error) {
