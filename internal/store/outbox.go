@@ -190,3 +190,76 @@ func (s *OutboxStore) MarkFailed(ctx context.Context, tx *sql.Tx, id, claimToken
 	}
 	return res.RowsAffected()
 }
+
+func (s *OutboxStore) ClaimPending(ctx context.Context, limit int) ([]ClaimedEvent, error) {
+	const q = `
+				WITH picked AS (
+					SELECT id FROM outbox_events
+					WHERE status = 'PENDING'
+					AND (next_retry_at IS NULL OR next_retry_at <= now())		
+					ORDER BY created_at ASC
+					FOR UPDATE SKIP LOCKED
+					LIMIT $1
+				)
+				UPDATE outbox_events
+				SET status = 'PROCESSING',
+					claim_token = gen_random_uuid(),
+					processing_started_at = now(),
+					updated_at = now()
+				WHERE id IN (SELECT id FROM picked)
+				RETURNING id, event_type, payload, claim_token, attempt_count
+				`
+	rows, err := s.DB.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]ClaimedEvent, 0, limit)
+	for rows.Next() {
+		var e ClaimedEvent
+		if err := rows.Scan(&e.ID, &e.EventType, &e.Payload, &e.ClaimToken, &e.AttemptCount); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+type OutboxStats struct {
+	Pending    int `json:"pending"`
+	Processing int `json:"processing"`
+	Sent       int `json:"sent"`
+	Failed     int `json:"failed"`
+}
+
+func (s *OutboxStore) Stats(ctx context.Context) (OutboxStats, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT status, count(*) 
+			   FROM outbox_events
+			   GROUP BY status`)
+	if err != nil {
+		return OutboxStats{}, err
+	}
+	defer rows.Close()
+
+	var st OutboxStats
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return OutboxStats{}, err
+		}
+		switch status {
+		case OutboxStatusPending:
+			st.Pending = n
+		case OutboxStatusProcessing:
+			st.Processing = n
+		case OutboxStatusSent:
+			st.Sent = n
+		case OutboxStatusFailed:
+			st.Failed = n
+		}
+	}
+	return st, rows.Err()
+}

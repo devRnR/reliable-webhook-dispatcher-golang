@@ -71,3 +71,12 @@ func (h *OutboxHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, events)
 }
+
+func (h *OutboxHandler) Stats(w http.ResponseWriter, r *http.Request) {
+	st, err := h.Outbox.Stats(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list outbox failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}

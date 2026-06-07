@@ -75,6 +75,7 @@ func main() {
 		PollInterval: 2 * time.Second,
 		Retry:        worker.RetryPolicy{MaxAttempts: 5},
 		Logger:       logger,
+		BatchSize:    10,
 	}
 	go func() {
 		if err := dispatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
