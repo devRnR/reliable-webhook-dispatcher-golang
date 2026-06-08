@@ -7,17 +7,22 @@ import (
 	"reliable-webhook-dispatcher/internal/store"
 )
 
-func NewServer(add string, db *sql.DB) *http.Server {
+func NewServer(add string, db *sql.DB, mock *MockReceiver) *http.Server {
 
 	orderH := &OrderHandler{Orders: store.NewOrderStore(db)}
 	outboxH := &OutboxHandler{Outbox: store.NewOutboxStore(db)}
+	readyH := &ReadyHandler{DB: db}
+	deliveryH := &DeliveryHandler{Delivery: store.NewDeliveryStore(db)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", health)
+	mux.HandleFunc("GET /ready", readyH.Ready)
 	mux.HandleFunc("POST /orders", orderH.Create)
-	mux.HandleFunc("POST /mock/webhook", MockWebhookReceiver)
 	mux.HandleFunc("GET /outbox", outboxH.List)
 	mux.HandleFunc("GET /outbox/stats", outboxH.Stats)
+	mux.HandleFunc("GET /delivery-attempts", deliveryH.List)
+	mux.HandleFunc("POST /mock/webhook", mock.Handle)
+	mux.HandleFunc("GET /mock/webhook/received", mock.Received)
 
 	return &http.Server{Addr: add, Handler: mux}
 }

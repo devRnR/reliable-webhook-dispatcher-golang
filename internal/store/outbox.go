@@ -263,3 +263,20 @@ func (s *OutboxStore) Stats(ctx context.Context) (OutboxStats, error) {
 	}
 	return st, rows.Err()
 }
+
+func (s *OutboxStore) RecoverStuck(ctx context.Context, lease time.Duration) (int64, error) {
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE outbox_events
+				SET status = 'PENDING',
+				    claim_token = NULL,
+				    processing_started_at = NULL,
+				    last_error = 'recovered from stuck processing',
+				    updated_at = now()
+				WHERE status = 'PROCESSING'
+				AND processing_started_at < now() - make_interval(secs => $1)`,
+		int(lease.Seconds()))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
