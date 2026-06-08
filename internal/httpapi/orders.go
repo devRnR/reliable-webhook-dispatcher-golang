@@ -1,7 +1,10 @@
 package httpapi
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"regexp"
 	"reliable-webhook-dispatcher/internal/store"
@@ -28,8 +31,13 @@ type OrderHandler struct {
 }
 
 func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read failed")
+		return
+	}
 	var req CreateOrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -42,20 +50,34 @@ func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.Orders.CreateOrderWithOutbox(r.Context(), store.CreateOrderInput{
-		CustomerID: req.CustomerID,
-		Amount:     req.Amount,
-	})
+	in := store.CreateOrderInput{CustomerID: req.CustomerID, Amount: req.Amount}
+	if key := r.Header.Get(HeaderIdempotencyKey); key != "" {
+		sum := sha256.Sum256(body)
+		in.IdempotencyKey = key
+		in.Endpoint = "POST /orders"
+		in.RequestHash = hex.EncodeToString(sum[:])
+	}
+
+	res, err := h.Orders.CreateOrderWithOutbox(r.Context(), in)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create order failed")
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, CreateOrderResponse{
-		OrderID: res.OrderID,
-		EventID: res.EventID,
-		Status:  res.Status,
-	})
+	switch res.Outcome {
+	case store.IdemExisting:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(res.CachedStatus)
+		_, _ = w.Write(res.CachedBody)
+	case store.IdemConflict:
+		writeError(w, http.StatusConflict, "idempotency conflict")
+	default:
+		writeJSON(w, http.StatusCreated, CreateOrderResponse{
+			OrderID: res.OrderID,
+			EventID: res.EventID,
+			Status:  res.Status,
+		})
+	}
 }
 
 type OutboxHandler struct {

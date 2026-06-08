@@ -101,6 +101,7 @@ func (d *Dispatcher) send(ctx context.Context, ev *store.ClaimedEvent) (int, str
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Event-ID", ev.ID)
+	req.Header.Set("Idempotency-Key", ev.ID)
 
 	resp, err := d.HTTPClient.Do(req)
 	if err != nil {
