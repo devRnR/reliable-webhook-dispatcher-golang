@@ -1,17 +1,64 @@
-# docker-compose.yml
+# docker-compose.yml — 로컬 재현 (postgres + migrate + app + prometheus + grafana)
 services:
   postgres:
     image: postgres:17
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: webhook
+      POSTGRES_PASSWORD: webhook
+      POSTGRES_DB: webhook
     ports:
       - "55432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U webhook -d webhook"]
       interval: 3s
       timeout: 3s
       retries: 10
     volumes:
       - ./migrations:/migrations
+
+  migrate:
+    image: postgres:17
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations
+    # 모든 up 마이그레이션을 순서대로 적용(재실행 시 이미 적용분은 || true 로 통과) 후 종료
+    entrypoint: ["sh", "-c", "for f in /migrations/*.up.sql; do echo applying $$f; psql postgres://webhook:webhook@postgres:5432/webhook -f \"$$f\" || true; done"]
+
+  app:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      # 컨테이너 내부에서는 postgres 서비스 DNS로 접속(host의 55432 아님)
+      DATABASE_URL: postgres://webhook:webhook@postgres:5432/webhook?sslmode=disable
+      HTTP_ADDR: ":8080"
+      # 데모 시나리오에서 ?mode=fail 등으로 override (쉘에서 WEBHOOK_TARGET_URL=... 주면 우선)
+      WEBHOOK_TARGET_URL: ${WEBHOOK_TARGET_URL:-http://localhost:8080/mock/webhook}
+    ports:
+      - "8080:8080"
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - app
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"      # 로그인 없이 대시보드 열람(학습용)
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
