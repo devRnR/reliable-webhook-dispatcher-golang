@@ -3,11 +3,12 @@ package httpapi
 import (
 	"database/sql"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"reliable-webhook-dispatcher/internal/store"
 )
 
-func NewServer(add string, db *sql.DB, mock *MockReceiver) *http.Server {
+func NewServer(add string, db *sql.DB, mock *MockReceiver, metricsHandler http.Handler, logger *slog.Logger) *http.Server {
 
 	orderH := &OrderHandler{Orders: store.NewOrderStore(db)}
 	outboxH := &OutboxHandler{Outbox: store.NewOutboxStore(db)}
@@ -18,6 +19,7 @@ func NewServer(add string, db *sql.DB, mock *MockReceiver) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", health)
 	mux.HandleFunc("GET /ready", readyH.Ready)
+	mux.Handle("GET /metrics", metricsHandler)
 	mux.HandleFunc("POST /orders", orderH.Create)
 	mux.HandleFunc("GET /outbox", outboxH.List)
 	mux.HandleFunc("GET /outbox/stats", outboxH.Stats)
@@ -28,7 +30,7 @@ func NewServer(add string, db *sql.DB, mock *MockReceiver) *http.Server {
 	mux.HandleFunc("POST /admin/dead-letters/replay", adminH.ReplayAll)
 	mux.HandleFunc("POST /admin/outbox/{event_id}/replay", adminH.Replay)
 
-	return &http.Server{Addr: add, Handler: mux}
+	return &http.Server{Addr: add, Handler: RequestLogger(logger, mux)}
 }
 
 func health(w http.ResponseWriter, r *http.Request) {

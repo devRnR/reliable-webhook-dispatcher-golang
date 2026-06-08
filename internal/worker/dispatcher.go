@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"reliable-webhook-dispatcher/internal/metrics"
 	"reliable-webhook-dispatcher/internal/store"
 	"time"
 )
@@ -39,6 +40,7 @@ type Dispatcher struct {
 	Retry        RetryPolicy
 	Logger       *slog.Logger
 	BatchSize    int
+	Metrics      *metrics.Metrics
 }
 
 func (d *Dispatcher) Run(ctx context.Context) error {
@@ -79,7 +81,10 @@ func (d *Dispatcher) dispatchEvent(ctx context.Context, ev *store.ClaimedEvent) 
 	}
 
 	// 외부 호출은 transaction 밖
+	start := time.Now()
 	code, body, callErr := d.send(ctx, ev)
+	d.Metrics.DeliveryDuration.Observe(time.Since(start).Seconds())
+
 	att.ResponseCode = code
 	att.ResponseBody = body
 
@@ -87,10 +92,38 @@ func (d *Dispatcher) dispatchEvent(ctx context.Context, ev *store.ClaimedEvent) 
 		att.ErrorMessage = callErr.Error()
 	}
 
+	d.Metrics.DeliveryAttempts.WithLabelValues(resultLabel(code, callErr)).Inc()
+
 	oc := classify(code, callErr, attemptNo, d.Retry.MaxAttempts)
 	att.Success = oc == outSent
 	if err := d.complete(ctx, att, oc); err != nil {
 		d.Logger.Error("delivery failed", "err", err)
+		return
+	}
+	d.Metrics.EventsTotal.WithLabelValues(statusLabel(oc)).Inc()
+}
+
+func resultLabel(code int, callErr error) string {
+	switch {
+	case callErr != nil:
+		return "error"
+	case code >= 200 && code < 300:
+		return "2xx"
+	case code >= 400 && code < 500:
+		return "4xx"
+	default:
+		return "5xx"
+	}
+}
+
+func statusLabel(oc outcome) string {
+	switch oc {
+	case outSent:
+		return "sent"
+	case outRetry:
+		return "retried"
+	default:
+		return "failed"
 	}
 }
 

@@ -9,12 +9,15 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"reliable-webhook-dispatcher/internal/config"
 	"reliable-webhook-dispatcher/internal/httpapi"
+	"reliable-webhook-dispatcher/internal/metrics"
 	"reliable-webhook-dispatcher/internal/store"
 	"reliable-webhook-dispatcher/internal/worker"
 	"syscall"
@@ -23,7 +26,10 @@ import (
 
 func main() {
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
 
 	if err := godotenv.Load(); err != nil {
 		logger.Error("env 파일 로드 실패", "err", err)
@@ -55,9 +61,31 @@ func main() {
 
 	logger.Info("db 연결 성공")
 
+	outboxStore := store.NewOutboxStore(db)
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				st, err := outboxStore.Stats(ctx)
+				if err != nil {
+					continue
+				}
+				m.Backlog.WithLabelValues("pending").Set(float64(st.Pending))
+				m.Backlog.WithLabelValues("processing").Set(float64(st.Processing))
+				m.Backlog.WithLabelValues("failed").Set(float64(st.Failed))
+			}
+		}
+	}()
+
 	// HTTP 서버 시작
 	mock := httpapi.NewMockReceiver()
-	srv := httpapi.NewServer(cfg.HTTPAddr, db, mock)
+	metricsHandler := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+	srv := httpapi.NewServer(cfg.HTTPAddr, db, mock, metricsHandler, logger)
 	go func() {
 		logger.Info("http 서버 시작", "addr", cfg.HTTPAddr)
 
@@ -78,6 +106,7 @@ func main() {
 		Retry:        worker.RetryPolicy{MaxAttempts: 5},
 		Logger:       logger,
 		BatchSize:    10,
+		Metrics:      m,
 	}
 
 	recoverer := &worker.Recoverer{
