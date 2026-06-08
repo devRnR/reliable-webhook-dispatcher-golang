@@ -1,0 +1,74 @@
+{
+  "uid": "webhook-dispatcher",
+  "title": "Webhook Dispatcher",
+  "tags": ["webhook"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Outbox Backlog (status별 적체)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 15 }, "unit": "short" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "webhook_outbox_backlog", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "상태 전이율 (sent/retried/failed per sec)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 15 }, "unit": "ops" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "rate(webhook_outbox_events_total[1m])", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "전송 결과율 (2xx/4xx/5xx/error per sec)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 15 }, "unit": "ops" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "rate(webhook_delivery_attempts_total[1m])", "legendFormat": "{{result}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "전송 소요 p95 (초)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 }, "unit": "s" },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum(rate(webhook_delivery_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" }
+      ]
+    }
+  ]
+}
