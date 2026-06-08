@@ -22,7 +22,7 @@ func TestAdminHandler_DeadLetters_getReturnsFailedEvents(t *testing.T) {
 	testDB := newAdminTestDB(t, ctx, "admin_dead_letters")
 	failedEventID := seedAdminFailedEvent(t, ctx, testDB)
 	seedAdminPendingEvent(t, ctx, testDB)
-	sut := NewServer(":0", testDB, NewMockReceiver()).Handler
+	sut := newHTTPTestHandler(testDB)
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/dead-letters", nil)
 	rec := httptest.NewRecorder()
@@ -53,7 +53,7 @@ func TestAdminHandler_Replay_postFailedEventMovesToPending(t *testing.T) {
 
 	testDB := newAdminTestDB(t, ctx, "admin_replay_one")
 	failedEventID := seedAdminFailedEvent(t, ctx, testDB)
-	sut := NewServer(":0", testDB, NewMockReceiver()).Handler
+	sut := newHTTPTestHandler(testDB)
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/outbox/"+failedEventID+"/replay", nil)
 	rec := httptest.NewRecorder()
@@ -82,7 +82,7 @@ func TestAdminHandler_Replay_postNonFailedEventReturnsConflict(t *testing.T) {
 
 	testDB := newAdminTestDB(t, ctx, "admin_replay_conflict")
 	pendingEventID := seedAdminPendingEvent(t, ctx, testDB)
-	sut := NewServer(":0", testDB, NewMockReceiver()).Handler
+	sut := newHTTPTestHandler(testDB)
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/outbox/"+pendingEventID+"/replay", nil)
 	rec := httptest.NewRecorder()
@@ -102,7 +102,7 @@ func TestAdminHandler_ReplayAll_postMovesAllFailedEventsToPending(t *testing.T) 
 	seedAdminFailedEvent(t, ctx, testDB)
 	seedAdminFailedEvent(t, ctx, testDB)
 	seedAdminPendingEvent(t, ctx, testDB)
-	sut := NewServer(":0", testDB, NewMockReceiver()).Handler
+	sut := newHTTPTestHandler(testDB)
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/dead-letters/replay", nil)
 	rec := httptest.NewRecorder()
