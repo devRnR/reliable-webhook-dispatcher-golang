@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"reliable-webhook-dispatcher/internal/store"
 	"time"
@@ -150,7 +151,7 @@ func (d *Dispatcher) complete(ctx context.Context, att store.DeliveryAttempt, oc
 	case outSent:
 		n, err = d.Outbox.MarkSentTx(ctx, tx, att.EventID, att.ClaimToken, att.AttemptNo)
 	case outRetry:
-		next := time.Now().Add(d.Retry.NextDelay(att.AttemptNo))
+		next := time.Now().Add(d.Retry.NextDelayJittered(att.AttemptNo))
 		n, err = d.Outbox.MarkRetryTx(ctx, tx, att.EventID, att.ClaimToken, att.AttemptNo, next, att.ErrorMessage)
 	case outFailed:
 		msg := att.ErrorMessage
@@ -167,4 +168,13 @@ func (d *Dispatcher) complete(ctx context.Context, att store.DeliveryAttempt, oc
 		return tx.Rollback()
 	}
 	return tx.Commit()
+}
+
+func (p RetryPolicy) NextDelayJittered(attempt int) time.Duration {
+	base := p.NextDelay(attempt)
+	jitterMax := int64(base) / 5
+	if jitterMax <= 0 {
+		return base
+	}
+	return base + time.Duration(rand.Int63n(jitterMax))
 }

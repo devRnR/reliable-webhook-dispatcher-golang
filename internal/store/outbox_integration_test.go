@@ -406,6 +406,126 @@ func TestOutboxStore_MarkSentTxWithStaleClaimToken_returnsZeroAfterRecovery(t *t
 	}
 }
 
+func TestOutboxStore_ReplayOne_failedEvent_movesToPendingAndPreservesAttemptCount(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testDB := newIsolatedTestDB(t, ctx, "replay_one_failed", 2)
+	eventID := seedFailedEvent(t, ctx, testDB, 5)
+	sut := NewOutboxStore(testDB)
+
+	replayed, err := sut.ReplayOne(ctx, eventID)
+	if err != nil {
+		t.Fatalf("replay one: %v", err)
+	}
+
+	if replayed != 1 {
+		t.Fatalf("replayed rows = %d, want 1", replayed)
+	}
+
+	var status string
+	var attemptCount int
+	var nextRetryAt sql.NullTime
+	var claimToken sql.NullString
+	var processingStartedAt sql.NullTime
+	if err := testDB.QueryRowContext(ctx,
+		`SELECT status, attempt_count, next_retry_at, claim_token, processing_started_at
+		   FROM outbox_events WHERE id = $1`, eventID).
+		Scan(&status, &attemptCount, &nextRetryAt, &claimToken, &processingStartedAt); err != nil {
+		t.Fatalf("query replayed event: %v", err)
+	}
+	if status != OutboxStatusPending {
+		t.Fatalf("status = %s, want PENDING", status)
+	}
+	if attemptCount != 5 {
+		t.Fatalf("attempt_count = %d, want preserved value 5", attemptCount)
+	}
+	if !nextRetryAt.Valid {
+		t.Fatal("next_retry_at is NULL, want replay to be immediately claimable")
+	}
+	if claimToken.Valid || processingStartedAt.Valid {
+		t.Fatalf("claim_token_valid=%v processing_started_at_valid=%v, want null/null",
+			claimToken.Valid, processingStartedAt.Valid)
+	}
+}
+
+func TestOutboxStore_ReplayOne_nonFailedEvent_returnsZeroAndDoesNotChangeStatus(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testDB := newIsolatedTestDB(t, ctx, "replay_one_non_failed", 2)
+	eventID := seedPendingEvent(t, ctx, testDB)
+	sut := NewOutboxStore(testDB)
+
+	replayed, err := sut.ReplayOne(ctx, eventID)
+	if err != nil {
+		t.Fatalf("replay one: %v", err)
+	}
+
+	if replayed != 0 {
+		t.Fatalf("replayed rows = %d, want 0", replayed)
+	}
+
+	var status string
+	if err := testDB.QueryRowContext(ctx, `SELECT status FROM outbox_events WHERE id = $1`, eventID).Scan(&status); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if status != OutboxStatusPending {
+		t.Fatalf("status = %s, want unchanged PENDING", status)
+	}
+}
+
+func TestOutboxStore_ReplayAllFailed_onlyFailedEventsMoveToPending(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testDB := newIsolatedTestDB(t, ctx, "replay_all_failed", 2)
+	seedFailedEvent(t, ctx, testDB, 3)
+	seedFailedEvent(t, ctx, testDB, 4)
+	seedPendingEvent(t, ctx, testDB)
+	sut := NewOutboxStore(testDB)
+
+	replayed, err := sut.ReplayAllFailed(ctx)
+	if err != nil {
+		t.Fatalf("replay all failed: %v", err)
+	}
+
+	if replayed != 2 {
+		t.Fatalf("replayed rows = %d, want 2", replayed)
+	}
+	stats, err := sut.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.Pending != 3 || stats.Failed != 0 {
+		t.Fatalf("stats = %+v, want pending=3 failed=0", stats)
+	}
+}
+
+func TestOutboxStore_ListDeadLetters_onlyReturnsFailedEvents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testDB := newIsolatedTestDB(t, ctx, "list_dead_letters", 2)
+	seedFailedEvent(t, ctx, testDB, 3)
+	seedFailedEvent(t, ctx, testDB, 4)
+	seedPendingEvent(t, ctx, testDB)
+
+	deadLetters, err := NewOutboxStore(testDB).ListDeadLetters(ctx, 100)
+	if err != nil {
+		t.Fatalf("list dead letters: %v", err)
+	}
+
+	if len(deadLetters) != 2 {
+		t.Fatalf("dead letters len = %d, want 2", len(deadLetters))
+	}
+	for _, event := range deadLetters {
+		if event.Status != OutboxStatusFailed {
+			t.Fatalf("dead letter status = %s, want FAILED", event.Status)
+		}
+	}
+}
+
 func newIsolatedTestDB(t *testing.T, ctx context.Context, prefix string, maxOpenConns int) *sql.DB {
 	t.Helper()
 
@@ -568,6 +688,39 @@ func seedProcessingEvent(t *testing.T, ctx context.Context, db *sql.DB, age time
 		t.Fatalf("seed processing event: %v", err)
 	}
 	return eventID, claimToken
+}
+
+func seedFailedEvent(t *testing.T, ctx context.Context, db *sql.DB, attemptCount int) string {
+	t.Helper()
+
+	var eventID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO outbox_events
+			(aggregate_type, aggregate_id, event_type, payload, status, attempt_count, last_error, claim_token, processing_started_at)
+		VALUES
+			('order', gen_random_uuid(), 'order.created', '{"ok":true}', 'FAILED', $1,
+			 'delivery failed', gen_random_uuid(), now() - interval '1 minute')
+		RETURNING id
+	`, attemptCount).Scan(&eventID); err != nil {
+		t.Fatalf("seed failed event: %v", err)
+	}
+	return eventID
+}
+
+func seedPendingEvent(t *testing.T, ctx context.Context, db *sql.DB) string {
+	t.Helper()
+
+	var eventID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO outbox_events
+			(aggregate_type, aggregate_id, event_type, payload, status)
+		VALUES
+			('order', gen_random_uuid(), 'order.created', '{"ok":true}', 'PENDING')
+		RETURNING id
+	`).Scan(&eventID); err != nil {
+		t.Fatalf("seed pending event: %v", err)
+	}
+	return eventID
 }
 
 func countRows(t *testing.T, ctx context.Context, db *sql.DB, table string) int {
