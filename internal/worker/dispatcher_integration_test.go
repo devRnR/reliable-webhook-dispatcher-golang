@@ -28,9 +28,13 @@ func TestDispatcher_DispatchOnce_2xxMarksSentAndRecordsAttempt(t *testing.T) {
 	eventID := seedDispatcherPendingEvent(t, ctx, testDB, 0)
 
 	var received int32
+	var idempotencyKeyReceived int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Event-ID") == eventID {
 			atomic.AddInt32(&received, 1)
+		}
+		if r.Header.Get("Idempotency-Key") == eventID {
+			atomic.AddInt32(&idempotencyKeyReceived, 1)
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -49,6 +53,9 @@ func TestDispatcher_DispatchOnce_2xxMarksSentAndRecordsAttempt(t *testing.T) {
 	}
 	if atomic.LoadInt32(&received) != 1 {
 		t.Fatalf("receiver count = %d, want 1", received)
+	}
+	if atomic.LoadInt32(&idempotencyKeyReceived) != 1 {
+		t.Fatalf("idempotency key count = %d, want 1", idempotencyKeyReceived)
 	}
 	assertDeliveryAttempt(t, ctx, testDB, eventID, 1, 200, true, false)
 }

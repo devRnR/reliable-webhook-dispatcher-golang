@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -137,6 +138,199 @@ func TestOrderStore_CreateOrderWithOutbox_rollsBackOrderWhenOutboxInsertFails(t 
 	}
 	if got := countRows(t, ctx, testDB, "outbox_events"); got != 0 {
 		t.Fatalf("outbox_events count = %d, want 0 after rollback", got)
+	}
+}
+
+func TestOrderStore_CreateOrderWithOutbox_sameIdempotencyKeyAndRequestHash_reusesCachedResponse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testDB := newIsolatedTestDB(t, ctx, "order_idem_existing", 4)
+	sut := NewOrderStore(testDB)
+	firstOrder := CreateOrderInput{
+		CustomerID:     "00000000-0000-0000-0000-000000000001",
+		Amount:         "120.50",
+		IdempotencyKey: "order-key-1",
+		RequestHash:    "same-request-hash",
+		Endpoint:       "POST /orders",
+	}
+
+	created, err := sut.CreateOrderWithOutbox(ctx, firstOrder)
+	if err != nil {
+		t.Fatalf("create first order: %v", err)
+	}
+	replayed, err := sut.CreateOrderWithOutbox(ctx, firstOrder)
+	if err != nil {
+		t.Fatalf("replay order: %v", err)
+	}
+
+	if created.Outcome != IdemReserved {
+		t.Fatalf("created outcome = %v, want IdemReserved", created.Outcome)
+	}
+	if replayed.Outcome != IdemExisting || replayed.CachedStatus != 201 {
+		t.Fatalf("replayed outcome/status = %v/%d, want IdemExisting/201", replayed.Outcome, replayed.CachedStatus)
+	}
+
+	var cached struct {
+		OrderID string `json:"order_id"`
+		EventID string `json:"event_id"`
+		Status  string `json:"status"`
+	}
+	if err := json.Unmarshal(replayed.CachedBody, &cached); err != nil {
+		t.Fatalf("decode cached body: %v", err)
+	}
+	if cached.OrderID != created.OrderID || cached.EventID != created.EventID || cached.Status != "CREATED" {
+		t.Fatalf("cached body = %+v, want first order/event", cached)
+	}
+	if got := countRows(t, ctx, testDB, "orders"); got != 1 {
+		t.Fatalf("orders count = %d, want 1", got)
+	}
+	if got := countRows(t, ctx, testDB, "outbox_events"); got != 1 {
+		t.Fatalf("outbox_events count = %d, want 1", got)
+	}
+	if got := countRows(t, ctx, testDB, "idempotency_keys"); got != 1 {
+		t.Fatalf("idempotency_keys count = %d, want 1", got)
+	}
+}
+
+func TestOrderStore_CreateOrderWithOutbox_sameIdempotencyKeyAndDifferentRequestHash_returnsConflict(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testDB := newIsolatedTestDB(t, ctx, "order_idem_conflict", 4)
+	sut := NewOrderStore(testDB)
+
+	_, err := sut.CreateOrderWithOutbox(ctx, CreateOrderInput{
+		CustomerID:     "00000000-0000-0000-0000-000000000001",
+		Amount:         "120.50",
+		IdempotencyKey: "order-key-1",
+		RequestHash:    "first-request-hash",
+		Endpoint:       "POST /orders",
+	})
+	if err != nil {
+		t.Fatalf("create first order: %v", err)
+	}
+	conflict, err := sut.CreateOrderWithOutbox(ctx, CreateOrderInput{
+		CustomerID:     "00000000-0000-0000-0000-000000000001",
+		Amount:         "130.50",
+		IdempotencyKey: "order-key-1",
+		RequestHash:    "different-request-hash",
+		Endpoint:       "POST /orders",
+	})
+	if err != nil {
+		t.Fatalf("create conflicting order: %v", err)
+	}
+
+	if conflict.Outcome != IdemConflict {
+		t.Fatalf("conflict outcome = %v, want IdemConflict", conflict.Outcome)
+	}
+	if got := countRows(t, ctx, testDB, "orders"); got != 1 {
+		t.Fatalf("orders count = %d, want 1", got)
+	}
+	if got := countRows(t, ctx, testDB, "outbox_events"); got != 1 {
+		t.Fatalf("outbox_events count = %d, want 1", got)
+	}
+	if got := countRows(t, ctx, testDB, "idempotency_keys"); got != 1 {
+		t.Fatalf("idempotency_keys count = %d, want 1", got)
+	}
+}
+
+func TestOrderStore_CreateOrderWithOutbox_emptyIdempotencyKey_createsNewOrderEveryTime(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testDB := newIsolatedTestDB(t, ctx, "order_idem_empty", 4)
+	sut := NewOrderStore(testDB)
+	order := CreateOrderInput{
+		CustomerID: "00000000-0000-0000-0000-000000000001",
+		Amount:     "120.50",
+	}
+
+	if _, err := sut.CreateOrderWithOutbox(ctx, order); err != nil {
+		t.Fatalf("create first order: %v", err)
+	}
+	if _, err := sut.CreateOrderWithOutbox(ctx, order); err != nil {
+		t.Fatalf("create second order: %v", err)
+	}
+
+	if got := countRows(t, ctx, testDB, "orders"); got != 2 {
+		t.Fatalf("orders count = %d, want 2", got)
+	}
+	if got := countRows(t, ctx, testDB, "outbox_events"); got != 2 {
+		t.Fatalf("outbox_events count = %d, want 2", got)
+	}
+	if got := countRows(t, ctx, testDB, "idempotency_keys"); got != 0 {
+		t.Fatalf("idempotency_keys count = %d, want 0", got)
+	}
+}
+
+func TestOrderStore_CreateOrderWithOutbox_concurrentSameIdempotencyKey_createsOneOrderAndOneOutboxEvent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testDB := newIsolatedTestDB(t, ctx, "order_idem_concurrent", 12)
+	sut := NewOrderStore(testDB)
+	order := CreateOrderInput{
+		CustomerID:     "00000000-0000-0000-0000-000000000001",
+		Amount:         "120.50",
+		IdempotencyKey: "concurrent-order-key",
+		RequestHash:    "same-request-hash",
+		Endpoint:       "POST /orders",
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 10)
+	outcomes := make(chan IdemOutcome, 10)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			created, err := sut.CreateOrderWithOutbox(ctx, order)
+			if err != nil {
+				errs <- err
+				return
+			}
+			outcomes <- created.Outcome
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(outcomes)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("create concurrent order: %v", err)
+		}
+	}
+
+	reservedCount := 0
+	existingCount := 0
+	for outcome := range outcomes {
+		switch outcome {
+		case IdemReserved:
+			reservedCount++
+		case IdemExisting:
+			existingCount++
+		default:
+			t.Fatalf("unexpected outcome = %v", outcome)
+		}
+	}
+	if reservedCount != 1 || existingCount != 9 {
+		t.Fatalf("reserved/existing = %d/%d, want 1/9", reservedCount, existingCount)
+	}
+	if got := countRows(t, ctx, testDB, "orders"); got != 1 {
+		t.Fatalf("orders count = %d, want 1", got)
+	}
+	if got := countRows(t, ctx, testDB, "outbox_events"); got != 1 {
+		t.Fatalf("outbox_events count = %d, want 1", got)
+	}
+	if got := countRows(t, ctx, testDB, "idempotency_keys"); got != 1 {
+		t.Fatalf("idempotency_keys count = %d, want 1", got)
 	}
 }
 
@@ -327,6 +521,19 @@ func applyOutboxSchema(ctx context.Context, db *sql.DB) error {
 
 		CREATE INDEX idx_delivery_attempts_event
 			ON delivery_attempts (event_id, attempted_at DESC);
+
+		CREATE TABLE idempotency_keys
+		(
+			key             TEXT NOT NULL,
+			endpoint        TEXT NOT NULL,
+			request_hash    TEXT NOT NULL,
+			response_status INTEGER NOT NULL,
+			response_body   JSONB NOT NULL,
+			order_id        UUID NOT NULL REFERENCES orders (id),
+			event_id        UUID NOT NULL REFERENCES outbox_events (id),
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (endpoint, key)
+		);
 	`)
 	return err
 }

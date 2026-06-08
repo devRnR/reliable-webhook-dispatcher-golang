@@ -26,9 +26,9 @@ func (m *MockReceiver) Handle(w http.ResponseWriter, r *http.Request) {
 	case "timeout":
 		time.Sleep(10 * time.Second)
 	}
-	id := r.Header.Get("X-Event-ID")
+	id := r.Header.Get("Idempotency-Key")
 	if id == "" {
-		id = r.Header.Get("X-Request-ID")
+		id = r.Header.Get("X-Event-ID")
 	}
 	if id != "" {
 		m.mu.Lock()
