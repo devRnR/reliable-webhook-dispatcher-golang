@@ -16,7 +16,10 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
+	appmetrics "reliable-webhook-dispatcher/internal/metrics"
 	"reliable-webhook-dispatcher/internal/store"
 )
 
@@ -58,6 +61,12 @@ func TestDispatcher_DispatchOnce_2xxMarksSentAndRecordsAttempt(t *testing.T) {
 		t.Fatalf("idempotency key count = %d, want 1", idempotencyKeyReceived)
 	}
 	assertDeliveryAttempt(t, ctx, testDB, eventID, 1, 200, true, false)
+	if got := counterValue(t, dispatcher.Metrics.DeliveryAttempts.WithLabelValues("2xx")); got != 1 {
+		t.Fatalf("delivery_attempts{result=2xx} = %v, want 1", got)
+	}
+	if got := counterValue(t, dispatcher.Metrics.EventsTotal.WithLabelValues("sent")); got != 1 {
+		t.Fatalf("outbox_events{status=sent} = %v, want 1", got)
+	}
 }
 
 func TestDispatcher_DispatchOnce_5xxKeepsPendingWithBackoffAndAttempt(t *testing.T) {
@@ -83,6 +92,12 @@ func TestDispatcher_DispatchOnce_5xxKeepsPendingWithBackoffAndAttempt(t *testing
 			status, attemptCount, claimTokenValid, nextRetryValid)
 	}
 	assertDeliveryAttempt(t, ctx, testDB, eventID, 1, 500, false, false)
+	if got := counterValue(t, dispatcher.Metrics.DeliveryAttempts.WithLabelValues("5xx")); got != 1 {
+		t.Fatalf("delivery_attempts{result=5xx} = %v, want 1", got)
+	}
+	if got := counterValue(t, dispatcher.Metrics.EventsTotal.WithLabelValues("retried")); got != 1 {
+		t.Fatalf("outbox_events{status=retried} = %v, want 1", got)
+	}
 }
 
 func TestDispatcher_DispatchOnce_4xxMarksFailedWithoutRetry(t *testing.T) {
@@ -174,7 +189,18 @@ func newTestDispatcher(db *sql.DB, targetURL string, client *http.Client) *Dispa
 		Retry:        RetryPolicy{MaxAttempts: 5},
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		BatchSize:    10,
+		Metrics:      appmetrics.New(prometheus.NewRegistry()),
 	}
+}
+
+func counterValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+
+	var metric dto.Metric
+	if err := counter.Write(&metric); err != nil {
+		t.Fatalf("write counter metric: %v", err)
+	}
+	return metric.GetCounter().GetValue()
 }
 
 func newDispatcherTestDB(t *testing.T, ctx context.Context, prefix string) *sql.DB {
