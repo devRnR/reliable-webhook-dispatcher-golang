@@ -152,6 +152,17 @@ func TestDispatcher_RunCanceledContextReturnsCanceled(t *testing.T) {
 	}
 }
 
+func TestRetryPolicy_NextDelayJittered_attemptOneStaysWithinTwentyPercentJitter(t *testing.T) {
+	sut := RetryPolicy{MaxAttempts: 5}
+
+	for i := 0; i < 100; i++ {
+		delay := sut.NextDelayJittered(1)
+		if delay < 10*time.Second || delay >= 12*time.Second {
+			t.Fatalf("delay = %s, want [10s, 12s)", delay)
+		}
+	}
+}
+
 func newTestDispatcher(db *sql.DB, targetURL string, client *http.Client) *Dispatcher {
 	return &Dispatcher{
 		DB:           db,
