@@ -13,6 +13,7 @@ func NewServer(add string, db *sql.DB, mock *MockReceiver) *http.Server {
 	outboxH := &OutboxHandler{Outbox: store.NewOutboxStore(db)}
 	readyH := &ReadyHandler{DB: db}
 	deliveryH := &DeliveryHandler{Delivery: store.NewDeliveryStore(db)}
+	adminH := &AdminHandler{Outbox: store.NewOutboxStore(db)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", health)
@@ -23,6 +24,9 @@ func NewServer(add string, db *sql.DB, mock *MockReceiver) *http.Server {
 	mux.HandleFunc("GET /delivery-attempts", deliveryH.List)
 	mux.HandleFunc("POST /mock/webhook", mock.Handle)
 	mux.HandleFunc("GET /mock/webhook/received", mock.Received)
+	mux.HandleFunc("GET /admin/dead-letters", adminH.DeadLetters)
+	mux.HandleFunc("POST /admin/dead-letters/replay", adminH.ReplayAll)
+	mux.HandleFunc("POST /admin/outbox/{event_id}/replay", adminH.Replay)
 
 	return &http.Server{Addr: add, Handler: mux}
 }

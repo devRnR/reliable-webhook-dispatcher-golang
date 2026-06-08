@@ -280,3 +280,62 @@ func (s *OutboxStore) RecoverStuck(ctx context.Context, lease time.Duration) (in
 	}
 	return res.RowsAffected()
 }
+
+func (s *OutboxStore) ReplayOne(ctx context.Context, id string) (int64, error) {
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE outbox_events
+				SET status = 'PENDING',
+				    claim_token = NULL,
+				    processing_started_at = NULL,
+				    next_retry_at = now(),
+				    updated_at = now()
+				WHERE status = 'FAILED' 
+				AND id = $1`, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *OutboxStore) ReplayAllFailed(ctx context.Context) (int64, error) {
+	res, err := s.DB.ExecContext(ctx,
+		`UPDATE outbox_events
+				SET status = 'PENDING',
+				    claim_token = NULL,
+				    processing_started_at = NULL,
+				    next_retry_at = now(),
+				    updated_at = now()
+				WHERE status = 'FAILED'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *OutboxStore) ListDeadLetters(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT id, aggregate_type, aggregate_id, event_type, status,
+		        	  attempt_count, next_retry_at, claim_token, processing_started_at,
+		              created_at, updated_at
+		  		FROM outbox_events
+		  		WHERE status = 'FAILED'
+		  		ORDER BY updated_at DESC
+		  		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]OutboxEvent, 0, limit)
+	for rows.Next() {
+		var e OutboxEvent
+		if err := rows.Scan(
+			&e.ID, &e.AggregateType, &e.AggregateID, &e.EventType, &e.Status,
+			&e.AttemptCount, &e.NextRetryAt, &e.ClaimToken, &e.ProcessingStartedAt,
+			&e.CreatedAt, &e.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
