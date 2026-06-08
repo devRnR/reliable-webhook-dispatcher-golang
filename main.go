@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
@@ -55,7 +56,8 @@ func main() {
 	logger.Info("db 연결 성공")
 
 	// HTTP 서버 시작
-	srv := httpapi.NewServer(cfg.HTTPAddr, db)
+	mock := httpapi.NewMockReceiver()
+	srv := httpapi.NewServer(cfg.HTTPAddr, db, mock)
 	go func() {
 		logger.Info("http 서버 시작", "addr", cfg.HTTPAddr)
 
@@ -77,9 +79,28 @@ func main() {
 		Logger:       logger,
 		BatchSize:    10,
 	}
+
+	recoverer := &worker.Recoverer{
+		Outbox:   store.NewOutboxStore(db),
+		Lease:    1 * time.Minute,
+		Interval: 30 * time.Second,
+		Logger:   logger,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		if err := dispatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("dispatcher 종료", "err", err)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := recoverer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("recoverer finished", "err", err)
 		}
 	}()
 
@@ -98,5 +119,6 @@ func main() {
 		logger.Error("graceful shutdown 실패", "err", err)
 	}
 
+	wg.Wait()
 	logger.Info("종료 완료")
 }
