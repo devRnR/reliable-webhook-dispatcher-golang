@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
-	"errors"
+	"fmt"
 	"time"
 )
 
@@ -46,7 +46,7 @@ func (s *OutboxStore) List(ctx context.Context, limit int) ([]OutboxEvent, error
 		  		LIMIT $1`, limit)
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list outbox: %w", err)
 	}
 
 	defer func(rows *sql.Rows) {
@@ -67,7 +67,7 @@ func (s *OutboxStore) List(ctx context.Context, limit int) ([]OutboxEvent, error
 			&e.AttemptCount, &e.NextRetryAt, &e.ClaimToken, &e.ProcessingStartedAt,
 			&e.CreatedAt, &e.UpdatedAt,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan outbox row: %w", err)
 		}
 
 		events = append(events, e)
@@ -84,69 +84,6 @@ type ClaimedEvent struct {
 	AttemptCount int
 }
 
-func (s *OutboxStore) ClaimNext(ctx context.Context) (*ClaimedEvent, error) {
-	const q = `
-				UPDATE outbox_events
-				SET status = 'PROCESSING',
-				    claim_token = gen_random_uuid(),
-				    processing_started_at = now(),
-				    updated_at = now()
-				WHERE id = (
-				    SELECT id
-				    FROM outbox_events
-				    WHERE status = 'PENDING'
-				    AND (next_retry_at IS NULL OR next_retry_at <= now())
-				    ORDER BY created_at ASC
-				    LIMIT 1
-				)
-				RETURNING id, event_type, payload, claim_token, attempt_count`
-	var e ClaimedEvent
-	err := s.DB.QueryRowContext(ctx, q).Scan(&e.ID, &e.EventType, &e.Payload, &e.ClaimToken, &e.AttemptCount)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	return &e, nil
-}
-
-// deprecated
-func (s *OutboxStore) MarkSent(ctx context.Context, id, claimToken string) (int64, error) {
-	res, err := s.DB.ExecContext(ctx,
-		`UPDATE outbox_events 
-			   SET status = 'SENT',
-			       sent_at = now(),
-			       claim_token = NULL,
-			       processing_started_at = NULL,
-					updated_at = now() 
-			   WHERE id = $1
-			     AND status = 'PROCESSING'
-			     AND claim_token = $2`, id, claimToken)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// deprecated
-func (s *OutboxStore) ReleaseToPending(ctx context.Context, id, claimToken string) (int64, error) {
-	res, err := s.DB.ExecContext(ctx,
-		`UPDATE outbox_events
-			   SET status = 'PENDING',
-			       claim_token = NULL,
-			       processing_started_at = NULL,
-			       updated_at = now()
-			   WHERE id=$1
-			   AND status = 'PROCESSING'
-			   AND claim_token = $2`, id, claimToken)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
 // MarkSentTx: 2xx 성공 반영(같은 tx). claim_token guard. 영향행 수를 반환.
 func (s *OutboxStore) MarkSentTx(ctx context.Context, tx *sql.Tx, id, claimToken string, attemptNo int) (int64, error) {
 	res, err := tx.ExecContext(ctx,
@@ -155,7 +92,7 @@ func (s *OutboxStore) MarkSentTx(ctx context.Context, tx *sql.Tx, id, claimToken
 		        last_error=NULL, claim_token=NULL, processing_started_at=NULL, updated_at=now()
 		  WHERE id=$1 AND status='PROCESSING' AND claim_token=$2`, id, claimToken, attemptNo)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("mark sent: %w", err)
 	}
 	return res.RowsAffected()
 }
@@ -168,7 +105,7 @@ func (s *OutboxStore) MarkRetryTx(ctx context.Context, tx *sql.Tx, id, claimToke
 		        claim_token=NULL, processing_started_at=NULL, updated_at=now()
 		  WHERE id=$1 AND status='PROCESSING' AND claim_token=$2`, id, claimToken, attemptNo, nextRetryAt, lastErr)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("mark retry: %w", err)
 	}
 	return res.RowsAffected()
 }
@@ -186,7 +123,7 @@ func (s *OutboxStore) MarkFailed(ctx context.Context, tx *sql.Tx, id, claimToken
 				  AND status = 'PROCESSING'
 				  AND claim_token = $2`, id, claimToken, attemptNo, lastErr)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("mark failed: %w", err)
 	}
 	return res.RowsAffected()
 }
@@ -196,7 +133,7 @@ func (s *OutboxStore) ClaimPending(ctx context.Context, limit int) ([]ClaimedEve
 				WITH picked AS (
 					SELECT id FROM outbox_events
 					WHERE status = 'PENDING'
-					AND (next_retry_at IS NULL OR next_retry_at <= now())		
+					AND (next_retry_at IS NULL OR next_retry_at <= now())
 					ORDER BY created_at ASC
 					FOR UPDATE SKIP LOCKED
 					LIMIT $1
@@ -211,7 +148,7 @@ func (s *OutboxStore) ClaimPending(ctx context.Context, limit int) ([]ClaimedEve
 				`
 	rows, err := s.DB.QueryContext(ctx, q, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("claim pending: %w", err)
 	}
 	defer rows.Close()
 
@@ -219,7 +156,7 @@ func (s *OutboxStore) ClaimPending(ctx context.Context, limit int) ([]ClaimedEve
 	for rows.Next() {
 		var e ClaimedEvent
 		if err := rows.Scan(&e.ID, &e.EventType, &e.Payload, &e.ClaimToken, &e.AttemptCount); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan claimed event: %w", err)
 		}
 		out = append(out, e)
 	}
@@ -235,11 +172,11 @@ type OutboxStats struct {
 
 func (s *OutboxStore) Stats(ctx context.Context) (OutboxStats, error) {
 	rows, err := s.DB.QueryContext(ctx,
-		`SELECT status, count(*) 
+		`SELECT status, count(*)
 			   FROM outbox_events
 			   GROUP BY status`)
 	if err != nil {
-		return OutboxStats{}, err
+		return OutboxStats{}, fmt.Errorf("outbox stats: %w", err)
 	}
 	defer rows.Close()
 
@@ -248,7 +185,7 @@ func (s *OutboxStore) Stats(ctx context.Context) (OutboxStats, error) {
 		var status string
 		var n int
 		if err := rows.Scan(&status, &n); err != nil {
-			return OutboxStats{}, err
+			return OutboxStats{}, fmt.Errorf("scan stats row: %w", err)
 		}
 		switch status {
 		case OutboxStatusPending:
@@ -276,7 +213,7 @@ func (s *OutboxStore) RecoverStuck(ctx context.Context, lease time.Duration) (in
 				AND processing_started_at < now() - make_interval(secs => $1)`,
 		int(lease.Seconds()))
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("recover stuck: %w", err)
 	}
 	return res.RowsAffected()
 }
@@ -289,10 +226,10 @@ func (s *OutboxStore) ReplayOne(ctx context.Context, id string) (int64, error) {
 				    processing_started_at = NULL,
 				    next_retry_at = now(),
 				    updated_at = now()
-				WHERE status = 'FAILED' 
+				WHERE status = 'FAILED'
 				AND id = $1`, id)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("replay one: %w", err)
 	}
 	return res.RowsAffected()
 }
@@ -307,7 +244,7 @@ func (s *OutboxStore) ReplayAllFailed(ctx context.Context) (int64, error) {
 				    updated_at = now()
 				WHERE status = 'FAILED'`)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("replay all failed: %w", err)
 	}
 	return res.RowsAffected()
 }
@@ -322,7 +259,7 @@ func (s *OutboxStore) ListDeadLetters(ctx context.Context, limit int) ([]OutboxE
 		  		ORDER BY updated_at DESC
 		  		LIMIT $1`, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list dead letters: %w", err)
 	}
 	defer rows.Close()
 	out := make([]OutboxEvent, 0, limit)
@@ -333,7 +270,7 @@ func (s *OutboxStore) ListDeadLetters(ctx context.Context, limit int) ([]OutboxE
 			&e.AttemptCount, &e.NextRetryAt, &e.ClaimToken, &e.ProcessingStartedAt,
 			&e.CreatedAt, &e.UpdatedAt,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan dead letter row: %w", err)
 		}
 		out = append(out, e)
 	}

@@ -61,10 +61,10 @@ func TestDispatcher_DispatchOnce_2xxMarksSentAndRecordsAttempt(t *testing.T) {
 		t.Fatalf("idempotency key count = %d, want 1", idempotencyKeyReceived)
 	}
 	assertDeliveryAttempt(t, ctx, testDB, eventID, 1, 200, true, false)
-	if got := counterValue(t, dispatcher.Metrics.DeliveryAttempts.WithLabelValues("2xx")); got != 1 {
+	if got := counterValue(t, dispatcher.metrics.DeliveryAttempts.WithLabelValues("2xx")); got != 1 {
 		t.Fatalf("delivery_attempts{result=2xx} = %v, want 1", got)
 	}
-	if got := counterValue(t, dispatcher.Metrics.EventsTotal.WithLabelValues("sent")); got != 1 {
+	if got := counterValue(t, dispatcher.metrics.EventsTotal.WithLabelValues("sent")); got != 1 {
 		t.Fatalf("outbox_events{status=sent} = %v, want 1", got)
 	}
 }
@@ -92,10 +92,10 @@ func TestDispatcher_DispatchOnce_5xxKeepsPendingWithBackoffAndAttempt(t *testing
 			status, attemptCount, claimTokenValid, nextRetryValid)
 	}
 	assertDeliveryAttempt(t, ctx, testDB, eventID, 1, 500, false, false)
-	if got := counterValue(t, dispatcher.Metrics.DeliveryAttempts.WithLabelValues("5xx")); got != 1 {
+	if got := counterValue(t, dispatcher.metrics.DeliveryAttempts.WithLabelValues("5xx")); got != 1 {
 		t.Fatalf("delivery_attempts{result=5xx} = %v, want 1", got)
 	}
-	if got := counterValue(t, dispatcher.Metrics.EventsTotal.WithLabelValues("retried")); got != 1 {
+	if got := counterValue(t, dispatcher.metrics.EventsTotal.WithLabelValues("retried")); got != 1 {
 		t.Fatalf("outbox_events{status=retried} = %v, want 1", got)
 	}
 }
@@ -161,7 +161,7 @@ func TestDispatcher_RunCanceledContextReturnsCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	dispatcher := &Dispatcher{PollInterval: time.Hour}
+	dispatcher := &Dispatcher{pollInterval: time.Hour}
 	if err := dispatcher.Run(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run err = %v, want context.Canceled", err)
 	}
@@ -179,18 +179,24 @@ func TestRetryPolicy_NextDelayJittered_attemptOneStaysWithinTwentyPercentJitter(
 }
 
 func newTestDispatcher(db *sql.DB, targetURL string, client *http.Client) *Dispatcher {
-	return &Dispatcher{
-		DB:           db,
-		Outbox:       store.NewOutboxStore(db),
-		Delivery:     store.NewDeliveryStore(db),
-		TargetUrl:    targetURL,
-		HTTPClient:   client,
-		PollInterval: time.Hour,
-		Retry:        RetryPolicy{MaxAttempts: 5},
-		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		BatchSize:    10,
-		Metrics:      appmetrics.New(prometheus.NewRegistry()),
+	d, err := NewDispatcher(
+		DispatcherConfig{
+			PollInterval: time.Hour,
+			BatchSize:    10,
+			Retry:        RetryPolicy{MaxAttempts: 5},
+		},
+		DispatcherDeps{
+			Claimer:   store.NewOutboxStore(db),
+			Completer: store.NewDeliveryCompleter(db),
+			Sender:    NewHTTPSender(targetURL, client),
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Metrics:   appmetrics.New(prometheus.NewRegistry()),
+		},
+	)
+	if err != nil {
+		panic(err)
 	}
+	return d
 }
 
 func counterValue(t *testing.T, counter prometheus.Counter) float64 {

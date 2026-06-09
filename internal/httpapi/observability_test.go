@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	appmetrics "reliable-webhook-dispatcher/internal/metrics"
+	"reliable-webhook-dispatcher/internal/store"
 )
 
 func TestServer_Metrics_exposesWebhookMetrics(t *testing.T) {
@@ -26,7 +27,11 @@ func TestServer_Metrics_exposesWebhookMetrics(t *testing.T) {
 	m.DeliveryDuration.Observe(0.01)
 	m.Backlog.WithLabelValues("pending").Set(3)
 
-	sut := NewServer(":0", nil, NewMockReceiver(), promhttp.HandlerFor(reg, promhttp.HandlerOpts{}), discardLogger()).Handler
+	sut := NewServer(":0", ServerDeps{
+		Mock:           NewMockReceiver(),
+		MetricsHandler: promhttp.HandlerFor(reg, promhttp.HandlerOpts{}),
+		EnableMock:     true,
+	}, discardLogger()).Handler
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
@@ -89,7 +94,15 @@ func TestRequestLogger_successfulRequest_logsJSONFields(t *testing.T) {
 func newHTTPTestHandler(db *sql.DB) http.Handler {
 	reg := prometheus.NewRegistry()
 	appmetrics.New(reg)
-	return NewServer(":0", db, NewMockReceiver(), promhttp.HandlerFor(reg, promhttp.HandlerOpts{}), discardLogger()).Handler
+	return NewServer(":0", ServerDeps{
+		DB:             db,
+		Order:          store.NewOrderStore(db),
+		Outbox:         store.NewOutboxStore(db),
+		Delivery:       store.NewDeliveryStore(db),
+		Mock:           NewMockReceiver(),
+		MetricsHandler: promhttp.HandlerFor(reg, promhttp.HandlerOpts{}),
+		EnableMock:     true,
+	}, discardLogger()).Handler
 }
 
 func discardLogger() *slog.Logger {

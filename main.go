@@ -34,7 +34,11 @@ func main() {
 	if err := godotenv.Load(); err != nil {
 		logger.Error("env 파일 로드 실패", "err", err)
 	}
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Error("config 로드 실패", "err", err)
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -61,8 +65,18 @@ func main() {
 
 	logger.Info("db 연결 성공")
 
+	// composition root: store 는 여기서 한 번만 만들어 모든 소비자에 주입한다.
 	outboxStore := store.NewOutboxStore(db)
+	orderStore := store.NewOrderStore(db)
+	deliveryStore := store.NewDeliveryStore(db)
+	deliveryCompleter := store.NewDeliveryCompleter(db)
+
+	var wg sync.WaitGroup
+
+	// backlog metrics 수집 goroutine (shutdown 동기화를 위해 WaitGroup 에 포함)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
 
@@ -85,7 +99,15 @@ func main() {
 	// HTTP 서버 시작
 	mock := httpapi.NewMockReceiver()
 	metricsHandler := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
-	srv := httpapi.NewServer(cfg.HTTPAddr, db, mock, metricsHandler, logger)
+	srv := httpapi.NewServer(cfg.HTTPAddr, httpapi.ServerDeps{
+		DB:             db,
+		Order:          orderStore,
+		Outbox:         outboxStore,
+		Delivery:       deliveryStore,
+		Mock:           mock,
+		MetricsHandler: metricsHandler,
+		EnableMock:     cfg.EnableMockReceiver,
+	}, logger)
 	go func() {
 		logger.Info("http 서버 시작", "addr", cfg.HTTPAddr)
 
@@ -96,27 +118,31 @@ func main() {
 	}()
 
 	// Worker dispatcher 시작
-	dispatcher := &worker.Dispatcher{
-		DB:           db,
-		Outbox:       store.NewOutboxStore(db),
-		Delivery:     store.NewDeliveryStore(db),
-		TargetUrl:    cfg.WebhookTargetURL,
-		HTTPClient:   &http.Client{Timeout: 5 * time.Second},
-		PollInterval: 2 * time.Second,
-		Retry:        worker.RetryPolicy{MaxAttempts: 5},
-		Logger:       logger,
-		BatchSize:    10,
-		Metrics:      m,
+	dispatcher, err := worker.NewDispatcher(
+		worker.DispatcherConfig{
+			PollInterval: cfg.WorkerPollInterval,
+			BatchSize:    cfg.WorkerBatchSize,
+			Retry:        worker.RetryPolicy{MaxAttempts: cfg.RetryMaxAttempts},
+		},
+		worker.DispatcherDeps{
+			Claimer:   outboxStore,
+			Completer: deliveryCompleter,
+			Sender:    worker.NewHTTPSender(cfg.WebhookTargetURL, &http.Client{Timeout: 5 * time.Second}),
+			Logger:    logger,
+			Metrics:   m,
+		},
+	)
+	if err != nil {
+		logger.Error("dispatcher 생성 실패", "err", err)
+		os.Exit(1)
 	}
 
-	recoverer := &worker.Recoverer{
-		Outbox:   store.NewOutboxStore(db),
-		Lease:    1 * time.Minute,
-		Interval: 30 * time.Second,
-		Logger:   logger,
+	recoverer, err := worker.NewRecoverer(outboxStore, cfg.RecovererLease, cfg.RecovererInterval, logger)
+	if err != nil {
+		logger.Error("recoverer 생성 실패", "err", err)
+		os.Exit(1)
 	}
 
-	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

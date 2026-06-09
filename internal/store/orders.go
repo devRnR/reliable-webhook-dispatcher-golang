@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 )
 
 type OrderStore struct {
@@ -43,19 +44,19 @@ type CreateOrderResult struct {
 func (s *OrderStore) CreateOrderWithOutbox(ctx context.Context, in CreateOrderInput) (CreateOrderResult, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return CreateOrderResult{}, err
+		return CreateOrderResult{}, fmt.Errorf("begin tx: %w", err)
 	}
 
 	defer tx.Rollback()
 
 	orderID, eventID, err := insertOrderAndOutbox(ctx, tx, in.CustomerID, in.Amount)
 	if err != nil {
-		return CreateOrderResult{}, err
+		return CreateOrderResult{}, fmt.Errorf("insert order and outbox: %w", err)
 	}
 
 	if in.IdempotencyKey == "" {
 		if err := tx.Commit(); err != nil {
-			return CreateOrderResult{}, err
+			return CreateOrderResult{}, fmt.Errorf("commit order: %w", err)
 		}
 		return CreateOrderResult{OrderID: orderID, EventID: eventID, Status: "CREATED"}, nil
 	}
@@ -66,22 +67,22 @@ func (s *OrderStore) CreateOrderWithOutbox(ctx context.Context, in CreateOrderIn
 		"status":   "CREATED",
 	})
 	if err != nil {
-		return CreateOrderResult{}, err
+		return CreateOrderResult{}, fmt.Errorf("marshal idempotency response: %w", err)
 	}
 	reserved, err := s.idem.Insert(ctx, tx, in.Endpoint, in.IdempotencyKey, in.RequestHash, 201, respBody, orderID, eventID)
 	if err != nil {
-		return CreateOrderResult{}, err
+		return CreateOrderResult{}, fmt.Errorf("reserve idempotency key: %w", err)
 	}
 	if reserved {
 		if err := tx.Commit(); err != nil {
-			return CreateOrderResult{}, err
+			return CreateOrderResult{}, fmt.Errorf("commit order: %w", err)
 		}
 		return CreateOrderResult{OrderID: orderID, EventID: eventID, Status: "CREATED", Outcome: IdemReserved}, nil
 	}
 
 	existing, err := s.idem.Get(ctx, tx, in.Endpoint, in.IdempotencyKey)
 	if err != nil {
-		return CreateOrderResult{}, err
+		return CreateOrderResult{}, fmt.Errorf("get existing idempotency key: %w", err)
 	}
 	_ = tx.Rollback()
 	if existing.RequestHash == in.RequestHash {
