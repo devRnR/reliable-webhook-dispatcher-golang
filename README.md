@@ -1,113 +1,111 @@
 # Reliable Webhook Dispatcher
 
-Outbox 패턴 기반 웹훅 디스패처 학습용 Go 프로젝트입니다.
+도메인 이벤트를 외부로 **잃지 않고, 추적 가능하게, 재처리 가능하게** 전달하는 Go 웹훅 디스패처.
 
-주문 생성 같은 도메인 이벤트를 DB 트랜잭션 안에서 `outbox_events` 테이블에 저장하고, 별도 워커가 이벤트를 안정적으로 전송하는 구조를 목표로 합니다. 현재 구현 범위는 애플리케이션 부트스트랩, PostgreSQL 연결, graceful shutdown, 헬스체크 API, outbox 관련 초기 스키마입니다.
+주문 생성 같은 도메인 이벤트와 "보낼 이벤트"를 하나의 DB 트랜잭션에 묶고(outbox), 백그라운드 워커가 이벤트를 claim해 webhook으로 전송한다. 외부가 죽어도 이벤트는 보존되고, 실패는 기록·재시도되며, 끝내 안 되면 dead-letter로 남아 재처리된다.
 
-## Stack
+![Grafana — 부하 중 Outbox Backlog가 솟았다 worker가 소비하며 빠지는 톱니, sent 전이율](assets/grafana-dashboard.png)
 
-- Go 1.25.1
-- PostgreSQL 17
-- pgx
-- godotenv
+## 무엇을 보장하나
 
-## Current Features
+| 목표 | 방법 | 검증 |
+|---|---|---|
+| **유실 0** | order와 outbox event를 같은 트랜잭션에 커밋 (dual-write 제거) | 정상 300 / 5xx 50 / 4xx 20건 부하 — 던진 주문 전부 수렴 |
+| **중복 0 (내부 상태)** | `FOR UPDATE SKIP LOCKED` claim + `claim_token` fencing | 동시 N워커 claim 중복 0 (`go test -race`) |
+| **중복 0 (외부 효과)** | `event_id`를 `Idempotency-Key`로 송신 + receiver dedup | mock distinct == 던진 수 |
+| **추적 가능** | 모든 전송 시도 `delivery_attempts` 기록 + Prometheus + 구조화 로그 | `/metrics`, Grafana 대시보드 |
+| **포기 0** | 재시도/backoff → `FAILED` dead-letter → 운영자 replay | 4xx 20건 FAILED → replay로 전부 복구 |
 
-- `.env` 기반 설정 로드
-- PostgreSQL 연결 확인
-- HTTP 서버 실행
-- `GET /health` 헬스체크
-- SIGINT/SIGTERM 기반 graceful shutdown
-- orders, outbox_events, delivery_attempts 초기 스키마
+## 왜 만들었나
 
-## Run
+전 직장에서 외부로 알림과 이벤트를 발송하면서 세 가지에 막혔다. 외부가 죽으면 발송이 통째로 유실됐고, 발송 여부를 확인할 이력이 없어 로그를 뒤져야 했으며, 재시도는 막연히 붙어 있어 왜·몇 번 실패했는지 알 수 없었다. 전송이 개발자의 제어 밖에 있었다.
 
-`.env`를 준비합니다.
+이 프로젝트는 그 문제를 정면으로 푼다 — 메시지 브로커 같은 인프라로 덮는 대신, 데이터의 흐름·외부 트랜잭션의 분리·outbox 워커·남는 기록이라는 본질을 직접 구현했다.
 
-```env
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-POSTGRES_DB=postgres
-DATABASE_URL=postgres://postgres:postgres@localhost:55432/postgres?sslmode=disable
-HTTP_ADDR=:8080
+## 아키텍처
+
+```text
+POST /orders ──(한 트랜잭션)──> orders + outbox_events(PENDING)
+                                       │
+        worker pool ──claim (SKIP LOCKED + claim_token)──> PROCESSING
+                                       │
+                          webhook 전송 (트랜잭션 밖)
+                       ┌───────────────┼───────────────┐
+                      2xx          5xx / timeout       4xx
+                       │               │                │
+                      SENT       PENDING(재시도+backoff)  FAILED(dead-letter)
+                                                          │
+                                                  replay → PENDING
 ```
 
-환경 변수:
+- 상태는 `PENDING → PROCESSING → SENT / PENDING / FAILED` 5개만 사용한다.
+- 여러 워커가 동시에 같은 이벤트를 집지 않도록 `FOR UPDATE SKIP LOCKED`로 claim한다.
+- claim 트랜잭션이 끝난 뒤(락 공백) 늦게 돌아온 워커의 상태 덮어쓰기는 `claim_token`으로 차단한다.
+- 워커가 전송 도중 죽어 `PROCESSING`에 묶인 이벤트는 lease 초과 시 recovery가 `PENDING`으로 회수한다.
 
-- `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`: Docker Compose PostgreSQL 설정
-- `DATABASE_URL`: 애플리케이션이 접속할 PostgreSQL DSN
-- `HTTP_ADDR`: HTTP 서버 바인딩 주소
+## 신뢰성 검증
 
-PostgreSQL을 실행합니다.
+부하·스트레스 테스트로 위 보장을 실측했다 (상세 · 재현 절차: [loadtest/RESULT.md](loadtest/RESULT.md)).
 
-```bash
-docker compose up -d
-```
+| 시나리오 | 결과 |
+|---|---|
+| 정상 300건 | sent +300, 중복 0, 생성 884 req/s (p95 125ms) |
+| 5xx 장애 50건 | 전송 실패분이 `PENDING`으로 보존 → 복구 후 자동 수렴, 유실 0 |
+| 4xx 장애 20건 | `FAILED` dead-letter → replay로 전부 복구 (멱등) |
 
-마이그레이션을 적용합니다.
+> 처리량 수치는 측정 환경에 따라 다르니 단언하지 않는다. 단언하는 건 구조적 사실 — 던진 건 전부 수렴하고, 같은 건 두 번 가지 않고, 외부가 죽어도 잃지 않는다.
 
-```bash
-psql "$DATABASE_URL" -f migrations/000001_init.up.sql
-```
-
-애플리케이션을 실행합니다.
-
-```bash
-go run .
-```
-
-정상 실행되면 DB 연결 성공 로그와 HTTP 서버 시작 로그가 출력됩니다.
+![GitHub Actions — unit / integration 통과](assets/ci-pass.png)
 
 ## API
 
-### Health Check
+| 메서드 · 경로 | 용도 |
+|---|---|
+| `POST /orders` | 주문 생성 + outbox 이벤트 (`Idempotency-Key` 지원) |
+| `GET /outbox` · `GET /outbox/stats` | outbox 조회 / 상태별 집계 |
+| `GET /delivery-attempts` | 전송 시도 이력 |
+| `GET /admin/dead-letters` | FAILED(dead-letter) 목록 |
+| `POST /admin/dead-letters/replay` | 전체 FAILED replay |
+| `POST /admin/outbox/{event_id}/replay` | 단건 replay |
+| `GET /metrics` | Prometheus 메트릭 |
+| `GET /health` · `GET /ready` | 헬스 / 레디니스 |
+
+## 실행
 
 ```bash
-curl http://localhost:8080/health
+docker compose up --build -d   # postgres + migrate + app + prometheus + grafana
+curl localhost:8080/health     # {"status":"ok"}
 ```
 
-응답:
+- app: http://localhost:8080
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000 (대시보드 자동 등록)
 
-```json
-{ "status": "ok" }
-```
+부하·장애 주입 데모 절차는 [loadtest/RESULT.md](loadtest/RESULT.md) 참고.
 
-## Database
+## 기술 스택
 
-초기 마이그레이션은 다음 테이블을 생성합니다.
+Go 1.25 · PostgreSQL 17 · `database/sql` + `pgx` · 표준 `net/http` · `log/slog` · Prometheus · Grafana · Docker Compose · GitHub Actions
 
-- `orders`: 주문 데이터 예시 테이블
-- `outbox_events`: 전송해야 할 도메인 이벤트 저장소
-- `delivery_attempts`: 웹훅 전송 시도 이력
-
-주요 outbox 상태:
-
-- `PENDING`: 전송 대기
-- `PROCESSING`: 워커가 처리 중
-- `SENT`: 전송 성공
-- `FAILED`: 전송 실패
-
-롤백이 필요하면 down 마이그레이션을 실행합니다.
+## 테스트
 
 ```bash
-psql "$DATABASE_URL" -f migrations/000001_init.down.sql
+go test -race ./...                                # 단위
+INTEGRATION_DATABASE_URL=... go test -race ./...   # 통합 (동시성 중복 0)
+k6 run loadtest/order.js                           # 부하
 ```
 
-## Test
-
-```bash
-go test ./...
-```
-
-현재 테스트는 HTTP health handler를 검증합니다.
-
-## Project Structure
+## 프로젝트 구조
 
 ```text
-.
-├── main.go                    # 앱 부트스트랩, DB 연결, graceful shutdown
-├── internal/config            # 환경 변수 설정
-├── internal/httpapi           # HTTP 서버와 핸들러
-├── migrations                 # PostgreSQL 스키마
-└── docker-compose.yml         # 로컬 PostgreSQL
+main.go              앱 조립 + 생명주기(graceful shutdown)
+internal/config      환경 설정
+internal/httpapi     HTTP 서버·핸들러·mock receiver·미들웨어
+internal/store       orders·outbox·delivery·idempotency
+internal/worker      dispatcher·recovery
+internal/metrics     Prometheus 메트릭
+migrations           PostgreSQL 스키마
+deploy               prometheus·grafana provisioning
+loadtest             k6 부하 스크립트 + 결과(RESULT.md)
+.github/workflows    CI (unit + integration)
 ```

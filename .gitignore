@@ -7,3 +7,6 @@
 ### Docs ###
 
 docs
+
+### capture override (임시, 커밋 제외) ###
+docker-compose.capture.yml
