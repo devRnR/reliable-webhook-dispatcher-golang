@@ -732,3 +732,97 @@ func countRows(t *testing.T, ctx context.Context, db *sql.DB, table string) int 
 	}
 	return count
 }
+
+// 실제 회수 시나리오를 처음부터 끝까지 돌린다.
+//
+// 기존 stale 토큰 테스트는 회수 직후(claim_token = NULL) 상태만 본다. 운영에서 더
+// 흔한 건 그다음이다 — 회수된 이벤트를 다른 워커가 이미 집어 갔고, 그 워커가 자기
+// 토큰을 들고 있는 상태에서 멈췄던 워커가 뒤늦게 깨어난다.
+//
+//	t0  A 가 claim            → PROCESSING, token = TA
+//	t1  A 가 전송 중 멈춤       (GC 정지, 네트워크 스톨)
+//	t2  lease 초과 → 회수      → PENDING, token = NULL
+//	t3  B 가 claim            → PROCESSING, token = TB
+//	t4  B 가 전송 완료         → SENT
+//	t5  A 가 깨어나 결과를 쓴다  → WHERE claim_token = TA → 0 rows → 거부
+//
+// SKIP LOCKED 는 t0 의 동시 충돌을 막지만 t1~t5 구간에는 락이 없다. 그 공백을
+// 막는 게 claim_token 이고, 이 테스트가 그걸 확인한다.
+func TestOutboxStore_ReclaimedByAnotherWorker_staleWriteRejectedAndWinnerKept(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	testDB := newIsolatedTestDB(t, ctx, "reclaim_fencing", 3)
+	store := NewOutboxStore(testDB)
+
+	// t0~t1: A 가 집어 간 채로 lease 를 넘겼다
+	eventID, tokenA := seedProcessingEvent(t, ctx, testDB, 2*time.Minute)
+
+	// t2: 회수
+	if n, err := store.RecoverStuck(ctx, time.Minute); err != nil || n != 1 {
+		t.Fatalf("recover stuck: n=%d err=%v", n, err)
+	}
+
+	// t3: B 가 재claim. 토큰이 새로 발급돼야 한다
+	claimed, err := store.ClaimPending(ctx, 10)
+	if err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %d, want 1", len(claimed))
+	}
+	tokenB := claimed[0].ClaimToken
+	if tokenB == tokenA {
+		t.Fatalf("재claim 이 같은 토큰을 재사용했다. fencing 이 성립하지 않는다: %s", tokenB)
+	}
+
+	// t5 를 먼저 시도한다 — 멈췄던 A 가 뒤늦게 쓰기를 시도하는 순간
+	txA, err := testDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx A: %v", err)
+	}
+	nA, err := store.MarkSentTx(ctx, txA, eventID, tokenA, 1)
+	if err != nil {
+		txA.Rollback()
+		t.Fatalf("mark sent with stale token: %v", err)
+	}
+	if nA != 0 {
+		txA.Rollback()
+		t.Fatalf("stale 토큰 쓰기가 %d 행을 바꿨다. 0 이어야 한다", nA)
+	}
+	txA.Rollback()
+
+	// t4: 유효한 토큰을 든 B 는 통과해야 한다.
+	// 여기까지 봐야 "무효한 것만 막고 유효한 건 통과시킨다" 가 증명된다.
+	txB, err := testDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx B: %v", err)
+	}
+	nB, err := store.MarkSentTx(ctx, txB, eventID, tokenB, 2)
+	if err != nil {
+		txB.Rollback()
+		t.Fatalf("mark sent with valid token: %v", err)
+	}
+	if nB != 1 {
+		txB.Rollback()
+		t.Fatalf("유효 토큰 쓰기가 %d 행을 바꿨다. 1 이어야 한다", nB)
+	}
+	if err := txB.Commit(); err != nil {
+		t.Fatalf("commit tx B: %v", err)
+	}
+
+	// 최종 상태는 B 가 쓴 것이어야 한다. A 가 덮었으면 여기서 갈린다
+	var status string
+	var attemptCount int
+	if err := testDB.QueryRowContext(ctx,
+		`SELECT status, attempt_count FROM outbox_events WHERE id = $1`, eventID,
+	).Scan(&status, &attemptCount); err != nil {
+		t.Fatalf("query final state: %v", err)
+	}
+	if status != OutboxStatusSent {
+		t.Fatalf("status = %s, want %s", status, OutboxStatusSent)
+	}
+	if attemptCount != 2 {
+		t.Fatalf("attempt_count = %d, want 2 (B 가 쓴 값)", attemptCount)
+	}
+}
