@@ -97,8 +97,10 @@ Go 1.25 · PostgreSQL 17 · `database/sql` + `pgx` · 표준 `net/http` · `log/
 ## 테스트
 
 ```bash
-go test -race ./...                                # 단위
-INTEGRATION_DATABASE_URL=... go test -race ./...   # 통합 (동시성 중복 0)
+go test -race ./...                                       # 단위 (통합은 skip)
+
+# 통합까지 돌리려면 RUN_DB_TESTS 가 있어야 한다. 없으면 조용히 skip 된다.
+RUN_DB_TESTS=1 TEST_DATABASE_URL=postgres://... go test -race ./...   # 30건 전부
 k6 run loadtest/order.js                           # 부하
 ```
 

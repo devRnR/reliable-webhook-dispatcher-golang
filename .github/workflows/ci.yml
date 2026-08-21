@@ -28,6 +28,10 @@ jobs:
           --health-cmd "pg_isready -U webhook"
           --health-interval 3s --health-timeout 3s --health-retries 10
     env:
+      # 통합 테스트는 RUN_DB_TESTS 로 열린다. 이게 없으면 t.Skip 으로 전부 건너뛰고
+      # 초록불만 뜬다 — 그러면 이 job 은 DB 를 띄워 놓고 아무것도 검증하지 않는다.
+      RUN_DB_TESTS: "1"
+      TEST_DATABASE_URL: postgres://webhook:webhook@localhost:5432/webhook?sslmode=disable
       INTEGRATION_DATABASE_URL: postgres://webhook:webhook@localhost:5432/webhook?sslmode=disable
     steps:
       - uses: actions/checkout@v4
@@ -35,4 +39,14 @@ jobs:
         with:
           go-version: "1.25"
       - run: for f in migrations/*.up.sql; do psql "$INTEGRATION_DATABASE_URL" -f "$f"; done
-      - run: go test -count=1 ./...
+      # 동시 claim 중복 0 을 주장하려면 race 검출기가 붙은 채로 돌아야 한다.
+      - run: go test -count=1 -race ./...
+      # 스킵된 채 초록불이 뜨는 걸 막는다. 통합 테스트가 실제로 돌았는지 센다.
+      - name: assert integration tests actually ran
+        run: |
+          skipped=$(go test -count=1 -v ./... 2>&1 | grep -c '^\s*--- SKIP' || true)
+          echo "skipped=$skipped"
+          if [ "$skipped" -ne 0 ]; then
+            echo "::error::통합 테스트 $skipped 건이 스킵됐다. RUN_DB_TESTS 설정을 확인해라."
+            exit 1
+          fi

@@ -18,7 +18,7 @@
 | **정상** | 300건 (vus 50) | 유실0 / 중복0 / 생성 처리량 | sent **+300**, mock distinct **300** · 중복 **0** / **884 req/s**, p95 **125ms** |
 | **5xx 장애** (transient) | 50건 | 자동 재시도 복구, 유실0 | 장애 중 50건 `PENDING` 보존 → 복구 후 **자동 sent +50**, failed 0 |
 | **4xx 장애** (permanent) | 20건 | dead-letter 격리 + 수동 replay, 유실0 | 20건 `FAILED` 격리 → `replay` → **sent +20**, 멱등 재replay **0** |
-| **통합테스트** | N워커 동시 claim | 동시성 중복0, 데이터레이스0 | `go test -race ./...` store/worker/httpapi **ok** |
+| **통합테스트** | N워커 동시 claim | 동시성 중복0, 데이터레이스0 | `RUN_DB_TESTS=1 TEST_DATABASE_URL=... go test -race ./...` 30건 전부 통과 **ok** |
 
 ## 단언 / 비단언
 
