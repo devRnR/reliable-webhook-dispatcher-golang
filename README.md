@@ -57,6 +57,13 @@ POST /orders ──(한 트랜잭션)──> orders + outbox_events(PENDING)
 
 ![GitHub Actions — unit / integration 통과](assets/ci-pass.png)
 
+## 보장하지 않는 것
+
+- **exactly-once delivery.** at-least-once로 보내고 `event_id`를 `Idempotency-Key`로 실어 받는 쪽이 거르게 한다. '전송'과 '전송했음 기록(SENT)'이 또 dual-write라 그 사이에 죽으면 중복이 나간다. 최종 dedup은 받는 쪽 몫이고, 이 프로젝트는 그 가정을 mock으로 관측만 했다
+- **처리량 절대치.** 측정 하네스까지만 만들었다. 나온 숫자는 내 노트북 기준이라 환경을 함께 적지 않으면 의미가 없다
+- **운영 검증.** 부하·장애 주입은 전부 로컬에서 돌렸다. 실제 트래픽 아래에서 이 구조가 맞았는지를 말해 줄 근거는 아직 없다
+- **lease timeout·backoff·워커 수는 근거 있는 값이 아니다.** 환경이 정하는 값인데 여기선 학습 기본값을 썼다. 다만 어디를 보고 정해야 하는지는 안다
+
 ## API
 
 | 메서드 · 경로 | 용도 |
